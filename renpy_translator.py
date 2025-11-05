@@ -5,27 +5,48 @@ import re
 import argparse
 from pathlib import Path
 
-# --- Expresiones Regulares para encontrar texto---
+# --- Lógica de Extracción Mejorada ---
 
-# Esta es la expresión regular principal. Busca capturar textos dentro de comillas dobles.
-# Está diseñada para manejar la mayoría de los casos en archivos .rpy, incluyendo:
-# - Diálogos simples: "Hello, world."
-# - Diálogos de personajes: e "I'm Eileen."
-# - Escapado de comillas internas: "He said, \\"Go away!\\""
-# No captura:
-# - Cadenas que parecen rutas de archivo o definiciones de imágenes para evitar traducir código.
-# - Cadenas dentro de bloques `python:` que no son para mostrar en pantalla.
-TEXT_REGEX = re.compile(
-    r'^(?!\s*#|define\s|image\s|style\s|transform\s|\$|\s*default\s|\s*screen\s|\s*python:|transform\s|imagebutton\s).*\b[a-zA-Z0-9_]+\s*L?u?"((?:\\"|[^"])*)"',
-    re.UNICODE
-)
+# Regex para capturar diálogos de personajes (ej: `e "Hola"`)
+# Captura el identificador del personaje y el texto.
+DIALOGUE_REGEX = re.compile(r'^\s*([\w\d]+)\s+"((?:\\"|[^"])*)"', re.UNICODE)
 
-# Regex para encontrar opciones de menú
-MENU_CHOICE_REGEX = re.compile(r'^\s*"((?:\\"|[^"])*)":')
+# Regex para capturar texto de narrador (ej: `"Hola"`) y opciones de menú (ej: `"Sí":`)
+# Es más simple y busca cualquier línea que comience con una cadena entre comillas.
+NARRATOR_REGEX = re.compile(r'^\s*"((?:\\"|[^"])*)"', re.UNICODE)
+
+# Conjunto de palabras clave que, si aparecen al inicio de una línea,
+# indican que la línea es probablemente código y no texto traducible.
+# Esto es más fiable que una expresión regular compleja.
+NON_TRANSLATABLE_KEYWORDS = {
+    'image', 'style', 'transform', 'scene', 'show', 'hide',
+    'play', 'queue', 'stop', 'voice', 'sound', 'music',
+    'font', 'size', 'color', 'define', 'default', 'persistent', '$',
+    'python', 'init', 'screen', 'timer', 'on', 'if', 'while'
+}
+
 
 def find_rpy_files(directory):
     """Encuentra todos los archivos .rpy en el directorio y subdirectorios."""
     return sorted(Path(directory).rglob("*.rpy"))
+
+def is_valid_text(text):
+    """
+    Una función de ayuda para filtrar cadenas que probablemente no necesiten traducción.
+    Actúa como una segunda capa de filtrado después de la lógica principal.
+    """
+    if not text or text.isdigit():
+        return False
+    # Excluir rutas de archivo que puedan haberse colado
+    if '/' in text and any(ext in text.lower() for ext in ['.png', '.jpg', '.ogg', '.ttf', '.webm']):
+        return False
+    # Excluir si es solo un placeholder de variable
+    if re.fullmatch(r'\[\w+\]', text):
+        return False
+    # Excluir si no contiene ninguna letra (ej: "...", "!!!")
+    if not re.search(r'[a-zA-Z]', text):
+        return False
+    return True
 
 def extract_text_from_file(filepath):
     """Extrae todas las cadenas de texto candidatas a traducción de un archivo."""
@@ -33,53 +54,44 @@ def extract_text_from_file(filepath):
     with open(filepath, 'r', encoding='utf-8') as f:
         in_python_block = False
         for line_num, line in enumerate(f, 1):
+            stripped_line = line.strip()
 
-            # Evitar bloques de código python
-            if line.strip().startswith('python:'):
-                in_python_block = True
-            if in_python_block and (line.strip() == '' or line.startswith(' ')):
+            # Omitir comentarios y líneas vacías
+            if not stripped_line or stripped_line.startswith('#'):
                 continue
-            else:
-                in_python_block = False
 
-            # Buscar opciones de menú
-            menu_match = MENU_CHOICE_REGEX.search(line)
-            if menu_match:
-                original_text = menu_match.group(1).strip()
+            # Manejo básico de bloques `python:`
+            if stripped_line.startswith('python:'):
+                in_python_block = True
+                continue
+            if in_python_block:
+                if stripped_line == '' or line.startswith('    '):
+                    continue
+                else:
+                    in_python_block = False
+
+            # Comprobar si la línea comienza con una palabra clave no traducible
+            first_word = stripped_line.split(' ')[0]
+            if first_word.lower() in NON_TRANSLATABLE_KEYWORDS:
+                continue
+
+            # Intentar encontrar coincidencias con las regex de diálogo o narrador
+            match = DIALOGUE_REGEX.search(stripped_line) or NARRATOR_REGEX.search(stripped_line)
+
+            if match:
+                # El texto es siempre el último grupo capturado por la regex
+                original_text = match.groups()[-1]
+
+                # Limpiar el texto de secuencias de escape de Ren'Py comunes
+                original_text = original_text.replace('\\"', '"').replace("\\'", "'")
+
                 if is_valid_text(original_text):
                     found_texts.append({
                         "original": original_text,
                         "file": str(filepath),
                         "line": line_num
                     })
-                continue # Evita que se procese dos veces si también coincide con la otra regex
-
-            # Buscar diálogos y otros textos
-            text_match = TEXT_REGEX.search(line)
-            if text_match:
-                original_text = text_match.group(1).strip()
-                if is_valid_text(original_text):
-                    found_texts.append({
-                        "original": original_text,
-                        "file": str(filepath),
-                        "line": line_num
-                    })
-
     return found_texts
-
-def is_valid_text(text):
-    """
-    Una función de ayuda para filtrar cadenas que probablemente no necesiten traducción.
-    """
-    if not text or text.isdigit():
-        return False
-    # Excluir rutas de archivo comunes
-    if any(ext in text for ext in ['.png', '.jpg', '.ogg', '.ttf', '.webm']):
-        return False
-    # Excluir variables o código simple
-    if re.fullmatch(r'\[\w+\]', text) or text.startswith('%'):
-        return False
-    return True
 
 def extract_mode(game_folder, output_csv):
     """
@@ -99,7 +111,7 @@ def extract_mode(game_folder, output_csv):
     for rpy_file in rpy_files:
         texts_in_file = extract_text_from_file(rpy_file)
         for text_info in texts_in_file:
-            # Añadir solo si no hemos visto este texto antes para evitar duplicados
+            # Añadir solo si el texto no ha sido visto antes para evitar duplicados
             if text_info["original"] not in seen_originals:
                 all_texts.append(text_info)
                 seen_originals.add(text_info["original"])
@@ -107,14 +119,14 @@ def extract_mode(game_folder, output_csv):
     print(f"Se encontraron {len(all_texts)} cadenas de texto únicas para traducir.")
 
     if not all_texts:
-        print("No se encontraron textos para traducir.")
+        print("No se encontraron textos para traducir. Si crees que esto es un error, puede que la lógica de extracción necesite ajustes.")
         return
 
     print(f"Creando archivo CSV en '{output_csv}'...")
     try:
         with open(output_csv, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f, quoting=csv.QUOTE_ALL)
-            # Escribir la cabecera del CSV
+            # Escribir la cabecera
             writer.writerow(["id", "original", "translation", "source_file", "line_number"])
             # Escribir los datos
             for i, text_info in enumerate(all_texts):
@@ -122,11 +134,11 @@ def extract_mode(game_folder, output_csv):
                 writer.writerow([
                     placeholder_id,
                     text_info["original"],
-                    "",  # Columna de traducción vacía para que la llenes
+                    "",  # Columna de traducción vacía
                     text_info["file"],
                     text_info["line"]
                 ])
-        print("¡Éxito! El archivo CSV ha sido creado. Ahora puedes abrirlo y añadir tus traducciones en la columna 'translation'.")
+        print(f"¡Éxito! El archivo '{output_csv}' ha sido creado. Ahora puedes abrirlo y añadir tus traducciones en la columna 'translation'.")
     except IOError as e:
         print(f"Error al escribir el archivo CSV: {e}")
 
